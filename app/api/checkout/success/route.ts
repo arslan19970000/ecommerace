@@ -1,17 +1,15 @@
-// app/api/checkout/success/route.ts
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { supabaseAdmin } from '@/lib/supabaseAdmin'
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!)
 
-
-
 export async function POST(req: Request) {
   try {
     const { session_id } = await req.json() as { session_id: string }
     if (!session_id) return NextResponse.json({ error: 'Missing session_id' }, { status: 400 })
 
+    // 1) Get Stripe session
     const session = await stripe.checkout.sessions.retrieve(session_id)
     if (session.payment_status !== 'paid') {
       return NextResponse.json({ error: 'Payment not completed' }, { status: 400 })
@@ -23,15 +21,28 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing metadata' }, { status: 400 })
     }
 
-    const cartItems: Array<{ cart_id: string; product_id: string; quantity: number; price: number }> = JSON.parse(cartMeta)
+    // 2) Prevent duplicate order using stripe_session_id
+    const { data: existingOrder } = await supabaseAdmin
+      .from('orders')
+      .select('*')
+      .eq('stripe_session_id', session.id)
+      .maybeSingle()
 
-    // Compute total server-side for safety
+    if (existingOrder) {
+      return NextResponse.json({ ok: true, order_id: existingOrder.id })
+    }
+
+    const cartItems: Array<{ cart_id: string; product_id: string; quantity: number; price: number }> = JSON.parse(cartMeta)
     const total = cartItems.reduce((s, i) => s + i.price * i.quantity, 0)
 
-    // 1) Create order
+    // 3) Create order
     const { data: order, error: orderErr } = await supabaseAdmin
       .from('orders')
-      .insert({ user_id, total_amount: total })
+      .insert({
+        user_id,
+        total_amount: total,
+        stripe_session_id: session.id,
+      })
       .select()
       .single()
 
@@ -40,12 +51,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Order creation failed' }, { status: 500 })
     }
 
-    // 2) Create order_items
+    // 4) Create order_items
     const orderItems = cartItems.map((i) => ({
       order_id: order.id,
       product_id: i.product_id,
       quantity: i.quantity,
-      price: i.price
+      price: i.price,
     }))
 
     const { error: itemsErr } = await supabaseAdmin.from('order_items').insert(orderItems)
@@ -54,15 +65,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Order items failed' }, { status: 500 })
     }
 
-    // 3) Clear cart rows (only those we checked out)
+    // 5) Clear cart
     const cartIds = cartItems.map((i) => i.cart_id)
-    const { error: clearErr } = await supabaseAdmin.from('carts').delete().in('id', cartIds)
-    if (clearErr) {
-      console.error(clearErr)
-      // Not fatal to the buyer, but log it
-    }
+    await supabaseAdmin.from('carts').delete().in('id', cartIds)
 
-    return NextResponse.json({ ok: true, order_id: order.id })
+    // ✅ Only return order info, NO email sending here
+    return NextResponse.json({ ok: true, order_id: order.id, user_id })
   } catch (e: any) {
     console.error(e)
     return NextResponse.json({ error: 'Server error' }, { status: 500 })
