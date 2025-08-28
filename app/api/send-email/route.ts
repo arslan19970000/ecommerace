@@ -2,6 +2,26 @@ import { NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabaseAdmin'
 import nodemailer from 'nodemailer'
 
+// ✅ Types for safety
+type OrderItem = {
+  id: string
+  quantity: number
+  price: number
+  products?: {
+    id: string
+    name: string
+    user_id: string
+  } | null
+}
+
+type Order = {
+  id: string
+  total_amount: number
+  status: string
+  payment_status: string
+  created_at: string
+  order_items?: OrderItem[]
+}
 
 export async function POST(req: Request) {
   try {
@@ -20,20 +40,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Email configuration missing' }, { status: 500 })
     }
 
-    // 1) Get order with order_items and products (simple join first)
+    // 1) Get order with order_items and products
     const { data: order, error: orderErr } = await supabaseAdmin
       .from('orders')
       .select(`
         *,
         order_items (
           *,
-          products (
-            *
-          )
+          products (*)
         )
       `)
       .eq('id', order_id)
-      .single()
+      .single<Order>()   // ✅ typed
 
     if (orderErr || !order) {
       console.log('❌ Order not found:', orderErr)
@@ -67,16 +85,16 @@ export async function POST(req: Request) {
       console.log('✅ SMTP connection verified')
     } catch (verifyError) {
       console.log('❌ SMTP connection failed:', verifyError)
-      return NextResponse.json({ 
-        error: 'Email service connection failed' 
-      }, { status: 500 })
+      return NextResponse.json({ error: 'Email service connection failed' }, { status: 500 })
     }
 
     // 4) Create order items summary for buyer email
-    const orderItemsHtml = order.order_items?.map(item => `
+    const orderItemsHtml = order.order_items?.map((item: OrderItem) => `
       <div style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 5px;">
         <p style="margin: 3px 0;"><b>${item.products?.name || 'Product'}</b></p>
-        <p style="margin: 3px 0; color: #666;">Quantity: ${item.quantity} × $${item.price} = $${(item.quantity * item.price).toFixed(2)}</p>
+        <p style="margin: 3px 0; color: #666;">
+          Quantity: ${item.quantity} × $${item.price} = $${(item.quantity * item.price).toFixed(2)}
+        </p>
       </div>
     `).join('') || ''
 
@@ -115,12 +133,6 @@ export async function POST(req: Request) {
                 View My Orders
               </a>
             </div>
-
-            <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;" />
-
-            <p style="font-size: 13px; color: #777; text-align: center;">
-              If you have any questions, feel free to <a href="mailto:${process.env.EMAIL_USER}" style="color: #3498db;">contact us</a>.
-            </p>
           </div>
         `,
       })
@@ -131,7 +143,7 @@ export async function POST(req: Request) {
     }
 
     // 6) Get seller information and send emails
-    const sellerEmails = new Map()
+    const sellerEmails = new Map<string, any>()
     let sellerEmailsSent = 0
 
     // Get unique seller user_ids from products
@@ -141,75 +153,42 @@ export async function POST(req: Request) {
 
     console.log('🔍 Found seller IDs:', sellerUserIds)
 
-    // Method 1: Try to get seller emails from profiles table
+    // Loop through sellers
     for (const sellerId of sellerUserIds) {
       try {
-        // First try with auth_users_id (common column name)
         let { data: sellerProfile, error: sellerErr } = await supabaseAdmin
           .from('profiles')
           .select('email, full_name, role')
           .eq('auth_users_id', sellerId)
           .single()
 
-        // If that fails, try with user_id
         if (sellerErr) {
           const result = await supabaseAdmin
             .from('profiles')
             .select('email, full_name, role')
             .eq('user_id', sellerId)
             .single()
-          
           sellerProfile = result.data
           sellerErr = result.error
         }
 
-        // If still fails, try with id
         if (sellerErr) {
           const result = await supabaseAdmin
             .from('profiles')
             .select('email, full_name, role')
             .eq('id', sellerId)
             .single()
-          
           sellerProfile = result.data
           sellerErr = result.error
         }
 
         if (!sellerErr && sellerProfile?.email && sellerProfile?.role === 'seller') {
-          console.log(`✅ Found seller profile: ${sellerProfile.email} (Role: seller)`)
-          
-          // Group items for this seller
           const sellerItems = order.order_items?.filter(item => item.products?.user_id === sellerId) || []
-          
           sellerEmails.set(sellerProfile.email, {
             name: sellerProfile.full_name || 'Seller',
             items: sellerItems,
-            sellerId: sellerId,
-            role: sellerProfile.role
+            sellerId
           })
-        } else if (sellerProfile?.role === 'buyer') {
-          console.log(`⚠️ User ${sellerId} is a buyer, not a seller - skipping email`)
-        } else {
-          console.log(`⚠️ No profile found for seller ID: ${sellerId}`)
-          
-          // Method 2: Try to get email from auth.users directly
-          try {
-            const { data: { user: sellerUser }, error: authErr } = await supabaseAdmin.auth.admin.getUserById(sellerId)
-            
-            if (!authErr && sellerUser?.email) {
-              console.log(`✅ Found seller email from auth: ${sellerUser.email}`)
-              
-              const sellerItems = order.order_items?.filter(item => item.products?.user_id === sellerId) || []
-              
-              sellerEmails.set(sellerUser.email, {
-                name: sellerUser.email.split('@')[0], // Use email prefix as name
-                items: sellerItems,
-                sellerId: sellerId
-              })
-            }
-          } catch (authError) {
-            console.log(`❌ Could not get seller email for ID: ${sellerId}`)
-          }
         }
       } catch (error) {
         console.log(`❌ Error getting seller ${sellerId}:`, error)
@@ -222,7 +201,7 @@ export async function POST(req: Request) {
     for (const [sellerEmail, sellerData] of sellerEmails) {
       console.log(`📤 Sending seller email to: ${sellerEmail}`)
       
-      const sellerItemsHtml = sellerData.items.map(item => `
+      const sellerItemsHtml = sellerData.items.map((item: OrderItem) => `
         <div style="background: #f8f9fa; padding: 10px; margin: 5px 0; border-radius: 5px;">
           <p style="margin: 3px 0;"><b>${item.products?.name}</b></p>
           <p style="margin: 3px 0; color: #666;">Quantity: ${item.quantity}</p>
@@ -239,48 +218,11 @@ export async function POST(req: Request) {
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px; background: #fafafa;">
               <h2 style="color: #3498db; text-align: center;">📦 New Order Notification</h2>
-              
-              <p style="font-size: 16px; color: #333;">Hi <b>${sellerData.name}</b> (Seller),</p>
-              
-              <p style="font-size: 16px; color: #333;">
-                Great news! 🎉 You have received a new order for your product(s).
-              </p>
-
-              <div style="background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #ddd; margin: 20px 0;">
-                <p style="margin: 5px 0; font-size: 16px;"><b>Order ID:</b> <span style="color: #555;">${order.id}</span></p>
-                <p style="margin: 5px 0; font-size: 16px;"><b>Customer:</b> ${user.email}</p>
-                <p style="margin: 5px 0; font-size: 16px;"><b>Order Date:</b> ${new Date(order.created_at).toLocaleDateString()}</p>
-              </div>
-
-              <h3 style="color: #34495e; margin: 20px 0 10px 0;">📋 Your Items in this Order:</h3>
+              <p>Hi <b>${sellerData.name}</b>, you have new items to ship.</p>
               ${sellerItemsHtml}
-
-              <div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 0; color: #27ae60; font-weight: bold;">
-                  💰 Your Earnings: $${sellerData.items.reduce((total, item) => total + (item.quantity * item.price), 0).toFixed(2)}
-                </p>
-              </div>
-
-              <p style="font-size: 15px; color: #e74c3c; font-weight: bold;">
-                ⚠️ Action Required: Please prepare these items for shipping as soon as possible.
-              </p>
-
-              <div style="text-align: center; margin: 30px 0;">
-                <a href="${process.env.NEXT_PUBLIC_APP_URL}/dashboard/seller/orders"
-                   style="background: #3498db; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-size: 16px; display: inline-block;">
-                  Manage Orders
-                </a>
-              </div>
-
-              <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;" />
-
-              <p style="font-size: 13px; color: #777; text-align: center;">
-                Questions? Contact us at <a href="mailto:${process.env.EMAIL_USER}" style="color: #3498db;">${process.env.EMAIL_USER}</a>
-              </p>
             </div>
           `
         })
-        
         console.log(`✅ Seller email sent to: ${sellerEmail}`)
         sellerEmailsSent++
       } catch (sellerEmailError) {
@@ -302,9 +244,6 @@ export async function POST(req: Request) {
 
   } catch (error: any) {
     console.error('💥 Email API Error:', error)
-    return NextResponse.json({ 
-      error: 'Failed to send emails', 
-      details: error.message
-    }, { status: 500 })
+    return NextResponse.json({ error: 'Failed to send emails', details: error.message }, { status: 500 })
   }
 }
